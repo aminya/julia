@@ -545,13 +545,6 @@ Stacktrace:
 ```
 """
 log1p(x)
-for f in (:log2, :log10)
-    @eval begin
-        @inline ($f)(x::Float64) = nan_dom_err(ccall(($(string(f)), libm), Float64, (Float64,), x), x)
-        @inline ($f)(x::Float32) = nan_dom_err(ccall(($(string(f, "f")), libm), Float32, (Float32,), x), x)
-        @inline ($f)(x::Real) = ($f)(float(x))
-    end
-end
 
 @inline function sqrt(x::Union{Float32,Float64})
     x < zero(x) && throw_complex_domainerror(:sqrt, x)
@@ -1118,6 +1111,7 @@ Return the high word of `x` as a `UInt32`.
 @inline highword(x::Float64) = highword(reinterpret(UInt64, x))
 @inline highword(x::UInt64)  = (x >>> 32) % UInt32
 @inline highword(x::Float32) = reinterpret(UInt32, x)
+@inline highword(u::UInt32) = u
 
 @inline fromhighword(::Type{Float64}, u::UInt32) = reinterpret(Float64, UInt64(u) << 32)
 @inline fromhighword(::Type{Float32}, u::UInt32) = reinterpret(Float32, u)

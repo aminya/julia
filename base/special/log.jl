@@ -10,6 +10,9 @@
 
 import .Base.unsafe_trunc
 import .Base.Math.@horner
+import .Base.TwicePrecision
+import .Base.Math.highword
+
 
 # Float64 lookup table.
 # to generate values:
@@ -395,3 +398,138 @@ for f in (:log,:log1p)
         ($f)(x::Real) = ($f)(float(x))
     end
 end
+
+# Below this line are log10 and log2 ports from Openlibm. The following copyright
+# notice is taken from there, but the original source is FDLIBM (see LICENSE.md).
+# ====================================================
+# Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+#
+# Developed at SunSoft, a Sun Microsystems, Inc. business.
+# Permission to use, copy, modify, and distribute this
+# software is freely granted, provided that this notice
+# is preserved.
+# ====================================================
+
+# Argument reduction
+"""
+    k, f = _log_range_reduction(x)
+
+Given `floatmin(x) < x < Inf`, compute
+
+    x == 2^k * (1+f)
+
+where `k` is an integer and `√2/2 ~< 1+f ~< √2`.
+"""
+@inline function _log_range_reduction(x::T) where T <: Union{Float32, Float64}
+    u = reinterpret(Unsigned, x)
+    k = (u >> significand_bits(T))%Int - exponent_bias(T) # exponent(T)
+
+    h = highword(u)  # assume that x > 0
+    if h & highword(significand_mask(T)) >= highword(sqrt(T(2))) & highword(significand_mask(T))
+        k += 1
+        w = exponent_half(T)
+    else
+        w = exponent_one(T)
+    end
+    x = reinterpret(T, (u & significand_mask(T)) | w)
+    f = x-1
+    return f, k
+end
+
+
+_trunc_lo(x::Float64) = reinterpret(Float64, reinterpret(UInt64, x) & 0xffff_ffff_0000_0000)
+_trunc_lo(x::Float32) = reinterpret(Float32, reinterpret(UInt32, x) & 0xffff_f000)
+
+
+"""
+    _log_kernel(f, y, invlnb, invl2b)
+
+The kernel function of the logarithm.
+ - `f, y` are the output of `_log_range_reduction`
+ - `invlnb` is `1/log(base)` (computed using extended precision)
+ - `invlog2b` is `1/log2(base)` (computed using extended precision, or 1)
+"""
+@inline function _log_kernel(f::T, k, invlnb, invlog2b) where {T<:Union{Float32,Float64}}
+    s  = f/(2+f)
+    s² = s * s
+    s⁴ = s² * s²
+    if T == Float32
+        t = s² * @horner(s⁴, 0.6666666f0, 0.28498787f0) +
+            s⁴ * @horner(s⁴, 0.40000972f0, 0.24279079f0)
+    elseif T == Float64
+        t = s² * @horner(s⁴, 6.666666666666735130e-01,
+                         2.857142874366239149e-01,
+                         1.818357216161805012e-01,
+                         1.479819860511658591e-01) +
+            s⁴ * @horner(s⁴, 3.999999999940941908e-01,
+                         2.222219843214978396e-01,
+                         1.531383769920937332e-01)
+    end
+    hf² = f*f/2
+    r = s*(hf²+t) # log(1+f) - f + f^2/2
+
+    A_hi = _trunc_lo(f - hf²)
+    A_lo = (f - A_hi) - hf² + r
+
+    if invlog2b isa TwicePrecision
+        B_hi = k*invlog2b.hi
+        B_lo = k*invlog2b.lo
+    else
+        B_hi = T(k*invlog2b)
+        B_lo = -zero(T) # exploit the fact that -0.0 + x is a no-op
+    end
+
+    V_hi = A_hi*invlnb.hi
+    V_lo = B_lo + (A_lo+A_hi)*invlnb.lo + A_lo*invlnb.hi
+    if T == Float32
+        return V_lo + V_hi + B_hi
+    elseif T == Float64
+        # Extra precision in for adding y*log10_2hi is not strictly needed
+        # since there is no very large cancellation near x = sqrt(2) or
+        # x = 1/sqrt(2), but we do it anyway since it costs little on CPUs
+        # with some parallelism and it reduces the error for many args.
+
+        W_hi = B_hi + V_hi
+        W_lo = V_lo + ((B_hi - W_hi) + V_hi)
+        return W_hi + W_lo
+    end
+end
+
+@inline function _log_base(x::T, invlnb, invlog2b) where {T}
+    j = 0
+    if x <= floatmin(T)
+        if x <= 0
+            if x == 0
+                return -T(Inf) # log(+-0)
+            else
+                throw(DomainError(x, "log(b,x) is only defined for non-negative x."))
+            end
+        end
+        x *= maxintfloat(T)/2
+        j -= significand_bits(T)
+    elseif !isfinite(x)
+        return x # +Inf/NaN
+    end
+    # x == 1       && return T(0) # logk(1) = +0 for any k
+
+    f, k = _log_range_reduction(x)
+    _log_kernel(f, k+j, invlnb, invlog2b)
+end
+
+# Wrapper function for logs
+invln2x(::Type{Float32}) = TwicePrecision(1.4428710938f+00, -1.7605285393f-04)
+invln2x(::Type{Float64}) = TwicePrecision(1.44269504072144627571e+00, 1.67517131648865118353e-10)
+
+log2(x::Real) = log2(float(x))
+log2(x::T) where T<:Union{Float32, Float64} =
+    _log_base(x, invln2x(T), 1)
+
+invln10x(::Type{Float32}) = TwicePrecision(4.3432617188f-01, -3.1689971365f-05)
+invln10x(::Type{Float64}) = TwicePrecision(4.34294481878168880939e-01, 2.50829467116452752298e-11)
+
+invlb10x(::Type{Float32}) = TwicePrecision(3.0102920532f-01, 7.9034151668f-07)
+invlb10x(::Type{Float64}) = TwicePrecision(3.01029995663611771306e-01, 3.69423907715893078616e-13)
+
+log10(x::Real) = log10(float(x))
+log10(x::T) where T<:Union{Float32, Float64} =
+    _log_base(x, invln10x(T), invlb10x(T))
